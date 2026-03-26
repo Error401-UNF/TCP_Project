@@ -19,20 +19,14 @@
           # Python and core library
           (python3.withPackages (ps: with ps; [
             pip
-            black # Formatter
             numpy
           ]))
-          
-          # LSP for VS Code "Pylance" or "Python" extensions
           python3Packages.python-lsp-server
-          
-          # Useful C libraries often needed by Python wheels
           stdenv.cc.cc.lib
           zlib
         ];
 
         shellHook = ''
-          # Fixes issues with libraries not being found by pip-installed packages
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}:''${LD_LIBRARY_PATH}"
           
           echo "-------------------------------------------------------"
