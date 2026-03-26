@@ -184,9 +184,9 @@ class TransportSocket:
             # We expect an ACK for seq_no + payload_len
             ack_goal = seq_no + payload_len
 
-            while True:
+            while  self.sock_fd != None:
                 print(f"Sending segment (seq={seq_no}, len={payload_len})")
-                self.sock_fd.sendto(segment.encode(), self.conn)
+                self.sock_fd.sendto(segment.encode(), self.conn)  # type: ignore # if this errors remove this and analyze issue
 
                 if self.wait_for_ack(ack_goal):
                     print(f"Segment {seq_no} acknowledged.")
@@ -221,7 +221,7 @@ class TransportSocket:
         Backend loop to handle receiving data and sending acknowledgments.
         All incoming packets are read in this thread only, to avoid concurrency conflicts.
         """
-        while not self.dying:
+        while not self.dying and self.sock_fd != None:
             try:
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
