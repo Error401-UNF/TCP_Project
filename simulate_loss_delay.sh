@@ -4,8 +4,8 @@
 IFACE="lo"
 
 # Parameters fopkr network simulation
-DELAY="100ms"    # Add 100ms delay
-LOSS="10%"       # Simulate 10% packet loss
+DELAY="200ms"    # Add 100ms delay
+LOSS="25%"       # Simulate 10% packet loss
 
 # Function to apply network conditions
 apply_network_conditions() {

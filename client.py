@@ -1,6 +1,7 @@
 import os
 import random
 import string
+from time import sleep
 from transport import TransportSocket, ReadMode
 
 def generate_random_data(size):
@@ -12,6 +13,7 @@ def generate_random_data(size):
 def client_main():
     # Initialize the client socket
     client_socket = TransportSocket()
+    client_socket.owner = "Client"
     client_socket.socket(sock_type="TCP_INITIATOR", port=54321, server_ip="127.0.0.1")
 
     # Send a file to the server
@@ -21,16 +23,27 @@ def client_main():
         print(f"Client: Sending file '{file_name}' to the server...")
         client_socket.send(file_data)
 
+    sleep(1)
+
     # Send randomly generated data to the server
     random_data = generate_random_data(128)
     print(f"Client: Sending randomly generated data to the server...")
     client_socket.send(random_data)
 
+    sleep(1)
+
     # Receive data from the server
-    print("Client: Waiting to receive data from the server...")
+    print("Client: Waiting to receive server data...")
     buf = [b""]
     client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
     print(f"Client: Received data from server:\n{buf[0].decode()}")
+
+    print("Client: Waiting to receive random data...")
+    buf = [b""]
+    client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
+    print(f"Client: Received data from server:\n{buf[0].decode()}")
+
+    sleep(1)
 
     # Close the client socket
     client_socket.close()

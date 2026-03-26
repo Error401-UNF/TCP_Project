@@ -1,7 +1,7 @@
 import struct
 
 # Constants for the project
-MAX_LEN = 1400  # Maximum packet length
+MAX_LEN = 400  # Maximum packet length
 MSS = MAX_LEN - struct.calcsize("!IIIIH")  # Maximum Segment Size (based on Packet header size)
 
 # Window variables
