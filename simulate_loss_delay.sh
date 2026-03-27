@@ -3,9 +3,9 @@
 # Network interface for localhost communication
 IFACE="lo"
 
-# Parameters fopkr network simulation
-DELAY="200ms"    # Add 100ms delay
-LOSS="25%"       # Simulate 10% packet loss
+# Parameters for network simulation
+DELAY="300ms"    # Add 100ms delay
+LOSS="10%"       # Simulate 10% packet loss
 
 # Function to apply network conditions
 apply_network_conditions() {
@@ -19,8 +19,13 @@ reset_network_conditions() {
     sudo tc qdisc del dev $IFACE root netem
 }
 
+kill_server() {
+    echo "killing server with id $SERVER_PID..."
+    kill -9 $SERVER_PID
+}
+
 # Trap exit signal to clean up network settings
-trap reset_network_conditions EXIT
+trap "reset_network_conditions && kill_server" EXIT
 
 # Apply network conditions
 apply_network_conditions
@@ -37,4 +42,3 @@ python3 client.py
 
 # Wait for processes to finish
 wait $SERVER_PID
-

@@ -37,6 +37,7 @@ def server_main():
     server_socket.recv(buf, 2048, flags=ReadMode.NO_FLAG)
     print(f"Server: Received random data from client:\n{buf[0].decode()}")
 
+    sleep(1) # wait for client to catch up
     
     # Send a file to the client
     file_name = "server_data.txt"

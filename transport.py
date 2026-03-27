@@ -2,7 +2,7 @@ import socket
 import struct
 import threading
 import time  
-from grading import MSS, DEFAULT_TIMEOUT
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -23,24 +23,25 @@ class ReadMode:
 
 # keep untouched
 class Packet:
-    def __init__(self, seq=0, ack=0, flags=0, payload=b""):
+    def __init__(self, seq=0, ack=0, flags=0, window = 0, payload=b"",sack=0):
         self.seq = seq
         self.ack = ack
         self.flags = flags
+        self.window = window
         self.payload = payload
-
+        self.sack = sack
     def encode(self):
         # Encode the packet header and payload into bytes
-        header = struct.pack("!IIIH", self.seq, self.ack, self.flags, len(self.payload))
+        header = struct.pack("!IIBHQH", self.seq, self.ack, self.flags, self.window, self.sack,len(self.payload))
         return header + self.payload
 
     @staticmethod
     def decode(data):
         # Decode bytes into a Packet object
-        header_size = struct.calcsize("!IIIH")
-        seq, ack, flags, payload_len = struct.unpack("!IIIH", data[:header_size])
+        header_size = struct.calcsize("!IIBHQH")
+        seq, ack, flags, window, sack, payload_len = struct.unpack("!IIBHQH", data[:header_size])
         payload = data[header_size:]
-        return Packet(seq, ack, flags, payload)
+        return Packet(seq, ack, flags, window, payload,sack)
 
 
 class TransportSocket:
@@ -58,14 +59,17 @@ class TransportSocket:
         self.thread = None
         self.owner = "Null"
 
-        # sliding window method
         self.window = {
-            "last_ack": 0,            # The next seq we expect from peer (used for receiving data)
-            "last_ack_time": time.time(),     # Time since last packet
-            "next_seq_expected": 0,   # The highest ack we've received for *our* transmitted data
+            "last_ack": 0,            # The next seq we expect from peer (receiving)
+            "last_ack_time": time.time(),
+            "next_seq_expected": 0,   # The highest ack we've received for our data
             "recv_buf": b"",          # Received data buffer
-            "recv_len": 0,            # How many bytes are in recv_buf
-            "next_seq_to_send": 0,    # The sequence number for the next packet we send
+            "recv_len": 0,            
+            "messages_available": 0,  # Count of completed EOF-terminated messages
+            "next_seq_to_send": 0,    # Pointer for next byte to send
+            "base": 0,                # Oldest unacknowledged byte
+            "current_window": MSS,    # Start with 1 MSS (AIMD growth)
+            "peer_advertised": MAX_NETWORK_BUFFER # What the peer says they can handle
         }
         self.sock_type = None
         self.conn = None
@@ -131,100 +135,99 @@ class TransportSocket:
             self.send_segment(data)
 
     def recv(self, buf, length, flags):
-        """
-        Retrieve received data from the buffer, with optional blocking behavior.
-
-        :param buf: Buffer to store received data (list of bytes or bytearray).
-        :param length: Maximum length of data to read
-        :param flags: ReadMode flag to control blocking behavior
-        :return: Number of bytes read
-
-        **TO BE REWORKED**
-        """
         read_len = 0
-
-        if length < 0:
-            print(f"TCP {self.owner}: ERROR: Negative length")
-            return EXIT_ERROR
-
-        # Always blocking read,
         with self.packet_cond:
             if flags == ReadMode.NO_FLAG:
-                while self.window["recv_len"] == 0:
-                    print(f"TCP {self.owner}: timeout lock aquired")
-                    self.packet_cond.wait()    
+                # Enforce assumption: Wait until at least ONE full message (ended by EOF) is ready
+                while self.window["messages_available"] == 0:
+                    if not self.packet_cond.wait(timeout=1.0):
+                        with self.death_lock:
+                            if self.dying: return 0
                 print(f"TCP {self.owner}: recv block released")
-
             
-            if flags in [ReadMode.NO_WAIT, ReadMode.NO_FLAG]:
-                if self.window["recv_len"] > 0:
-                    read_len = min(self.window["recv_len"], length)
-                    buf[0] = self.window["recv_buf"][:read_len]
-
-                    # Remove data from the buffer
-                    if read_len < self.window["recv_len"]:
-                        self.window["recv_buf"] = self.window["recv_buf"][read_len:]
-                        self.window["recv_len"] -= read_len
-                    else:
-                        self.window["recv_buf"] = b""
-                        self.window["recv_len"] = 0
-            else:
-                print(f"TCP {self.owner}: ERROR: Unknown or unimplemented flag.")
-                read_len = EXIT_ERROR
+            if self.window["recv_len"] > 0:
+                # We return the data available in the buffer. 
+                # Note: In a strictly 1-send-1-recv setup, we assume the application 
+                # wants the whole message.
+                read_len = min(self.window["recv_len"], length)
+                buf[0] = self.window["recv_buf"][:read_len]
+                self.window["recv_buf"] = self.window["recv_buf"][read_len:]
+                self.window["recv_len"] -= read_len
+                
+                # Consume one message credit
+                if self.window["messages_available"] > 0:
+                    self.window["messages_available"] -= 1
+                
+                print(f"TCP {self.owner}: read {read_len} bytes from buffer, {self.window['recv_len']} remaining")
+                # After consumption, notify backend/sender that window space may have opened
+                self.wait_cond.notify_all()
         return read_len
+
+    def get_advertised_window(self):
+        """ Calculate remaining buffer space for Flow Control """
+        return max(0, MAX_NETWORK_BUFFER - self.window["recv_len"])
 
     def send_segment(self, data):
         """
         Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
         """
-        offset = 0
+        start_seq = self.window["next_seq_to_send"]
         total_len = len(data)
 
-        # While there's data left to send
-        while offset < total_len:
-            payload_len = min(MSS, total_len - offset)
-
-            # Current sequence number
-            seq_no = self.window["next_seq_to_send"]
-            chunk = data[offset : offset + payload_len]
-
-            # Create a packet
-            segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-
-            # We expect an ACK for seq_no + payload_len
-            ack_goal = seq_no + payload_len
-
-            while  self.sock_fd != None:
-                print(f"TCP {self.owner}: Sending segment (seq={seq_no}, len={payload_len})")
-                self.sock_fd.sendto(segment.encode(), self.conn)  # type: ignore # if this errors remove this and analyze issue
-
-                if self.wait_for_ack(ack_goal):
-                    print(f"TCP {self.owner}: Segment {seq_no} acknowledged.")
-                    # Advance our next_seq_to_send
-                    self.window["next_seq_to_send"] += payload_len
+        while True:
+            with self.recv_lock:
+                # Check if all data in this call is ACKed
+                if (self.window["base"] - start_seq) >= total_len:
+                    print(f"TCP {self.owner}: All data segments acknowledged up to {self.window['base']}")
                     break
-                else:
-                    print(f"TCP {self.owner}: Timeout: Retransmitting segment.")
 
-            offset += payload_len
+                # Window is constrained by both AIMD (congestion) and Peer (flow control)
+                effective_window = min(self.window["current_window"], self.window["peer_advertised"])
 
-        # end with a syn flag send
+                # Send segments while within the window
+                while (self.window["next_seq_to_send"] - self.window["base"]) < effective_window:
+                    offset = self.window["next_seq_to_send"] - start_seq
+                    if offset >= total_len:
+                        break
+                    
+                    payload_len = min(MSS, total_len - offset)
+                    chunk = data[offset : offset + payload_len]
+                    
+                    print(f"TCP {self.owner}: Sending segment seq={self.window['next_seq_to_send']}, len={payload_len}, win={effective_window}")
+                    segment = Packet(
+                        seq=self.window["next_seq_to_send"], 
+                        ack=self.window["last_ack"], 
+                        flags=0, 
+                        window=self.get_advertised_window(),
+                        payload=chunk
+                    )
+                    
+                    self.sock_fd.sendto(segment.encode(), self.conn) # type: ignore
+                    self.window["next_seq_to_send"] += payload_len
+
+                # Wait for ACKs to advance the base
+                if not self.wait_cond.wait(timeout=DEFAULT_TIMEOUT):
+                    # Multiplicative Decrease: cut window in half on timeout
+                    self.window["current_window"] = max(MSS, self.window["current_window"] // 2)
+                    print(f"TCP {self.owner}: Timeout! Rolling back to base {self.window['base']}. New Window: {self.window['current_window']}")
+                    self.window["next_seq_to_send"] = self.window["base"]
+
+        self.send_eof_marker()
+    
+    def send_eof_marker(self):
         seq_no = self.window["next_seq_to_send"]
-        chunk = b"eof"
-        end_pkt = Packet(seq=seq_no, ack=self.window["last_ack"], flags=SYN_FLAG, payload=chunk)
-        payload_len = len(chunk)
-        ack_goal = seq_no + payload_len
-        while  self.sock_fd != None:
-            print(f"TCP {self.owner}: Sending eof (seq={seq_no}, len={payload_len})")
-            self.sock_fd.sendto(end_pkt.encode(), self.conn)  # type: ignore # if this errors remove this and analyze issue
-
+        print(f"TCP {self.owner}: Sending EOF marker at seq={seq_no}")
+        end_pkt = Packet(seq=seq_no, ack=self.window["last_ack"], flags=SYN_FLAG, window=self.get_advertised_window(), payload=b"eof")
+        ack_goal = seq_no + len(b"eof")
+        
+        while True:
+            self.sock_fd.sendto(end_pkt.encode(), self.conn) # type: ignore
             if self.wait_for_ack(ack_goal):
-                print(f"TCP {self.owner}: eof {seq_no} acknowledged.")
-                # Advance our next_seq_to_send
-                self.window["next_seq_to_send"] += payload_len
+                self.window["next_seq_to_send"] += len(b"eof")
+                print(f"TCP {self.owner}: EOF acknowledged")
                 break
             else:
-                print(f"TCP {self.owner}: Timeout: Retransmitting eof.")
+                print(f"TCP {self.owner}: EOF timeout, retrying...")
 
     def wait_for_ack(self, ack_goal):
         """
@@ -234,94 +237,74 @@ class TransportSocket:
         with self.recv_lock:
             start = time.time()
             while self.window["next_seq_expected"] < ack_goal:
-                elapsed = time.time() - start
-                remaining = DEFAULT_TIMEOUT - elapsed
-                if remaining <= 0: # DEFAULT_TIMEOUT - (time.time() - start) <= 0
+                remaining = DEFAULT_TIMEOUT - (time.time() - start)
+                if remaining <= 0 or not self.wait_cond.wait(timeout=remaining):
                     return False
-
-                self.wait_cond.wait(timeout=remaining)
-
             return True
 
     def backend(self):
-        """
-        Backend loop to handle receiving data and sending acknowledgments.
-        All incoming packets are read in this thread only, to avoid concurrency conflicts.
-        """
         while not self.dying and self.sock_fd != None:
             try:
-                data, addr = self.sock_fd.recvfrom(2048)
-                packet = Packet.decode(data)
-
-                # If no peer is set, establish connection (for listener)
+                raw_data, addr = self.sock_fd.recvfrom(2048)
                 if self.conn is None:
                     self.conn = addr
+                
+                packet = Packet.decode(raw_data)
+                if not packet: continue
 
-                # If it's an ACK packet, update our sending side
-                if (packet.flags & ACK_FLAG) != 0:
-                    with self.recv_lock:
-                        if packet.ack > self.window["next_seq_expected"]:
+                should_ack = False
+                ack_to_send = 0
+
+                with self.recv_lock:
+                    self.window["peer_advertised"] = packet.window
+                    
+                    # 1. Handle incoming ACKs
+                    if (packet.flags & ACK_FLAG) != 0:
+                        if packet.ack > self.window["base"]:
+                            print(f"TCP {self.owner}: Received New ack {packet.ack}")
+                            self.window["current_window"] += MSS
+                            self.window["base"] = packet.ack
                             self.window["next_seq_expected"] = packet.ack
-                        self.wait_cond.notify_all()
-                    continue
-
-                # Otherwise, assume it is a data packet
-                # Check if the sequence matches our 'last_ack' (in-order data)
-                if packet.seq == self.window["last_ack"]:
-                    with self.recv_lock:
-                        # Append payload to our receive buffer
-                        if (packet.flags & SYN_FLAG) == 0: # dont do this for eof packet
-                            self.window["recv_buf"] += packet.payload
-                            self.window["recv_len"] += len(packet.payload)
-
-                        
-                        print(f"TCP {self.owner}: Received segment {packet.seq} with {len(packet.payload)} bytes.")
-
-                        # Send back an acknowledgment
-                        ack_val = packet.seq + len(packet.payload)
-                        ack_packet = Packet(seq=0, ack=ack_val, flags=ACK_FLAG)
-                        self.sock_fd.sendto(ack_packet.encode(), addr)
-                        # Update last_ack
-                        self.window["last_ack"] = ack_val
-                        self.window["last_ack_time"] = time.time()
-
-                        # if last packet in group notify
-                        if (packet.flags & SYN_FLAG) != 0:
-                            # end of send
-                            print(f"TCP {self.owner}: eof detected!")
+                            self.wait_cond.notify_all()
+                    
+                    # 2. Handle incoming data/markers
+                    if packet.payload or (packet.flags & SYN_FLAG) != 0:
+                        if packet.seq == self.window["last_ack"]:
+                            if (packet.flags & SYN_FLAG) == 0:
+                                # Normal data
+                                if self.window["recv_len"] + len(packet.payload) <= MAX_NETWORK_BUFFER:
+                                    print(f"TCP {self.owner}: Received data, seq {packet.seq}, len {len(packet.payload)}")
+                                    self.window["recv_buf"] += packet.payload
+                                    self.window["recv_len"] += len(packet.payload)
+                                    self.window["last_ack"] += len(packet.payload)
+                                    should_ack = True
+                                else:
+                                    print(f"TCP {self.owner}: Buffer Full! Dropping {packet.seq}")
+                                    should_ack = True 
+                            else:
+                                # EOF Marker
+                                print(f"TCP {self.owner}: Received EOF marker at seq {packet.seq}")
+                                self.window["last_ack"] += len(packet.payload)
+                                should_ack = True
+                                # One complete message is now in the buffer
+                                self.window["messages_available"] += 1
+                            
+                            # Signal recv() only when data changed or EOF reached
                             self.packet_cond.notify_all()
-                else:
-                    # For a real TCP, we need to send duplicate ACK or ignore out-of-order data
-                    print(f"TCP {self.owner}: Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
-                    ack_packet = Packet(seq=0, ack=self.window["last_ack"], flags=ACK_FLAG)
-                    self.sock_fd.sendto(ack_packet.encode(), addr)
-                    """
-                    if packet.seq < self.window['last_ack']:
-                        # past packet. ack it and leave
-                        with self.recv_lock:
-                        # Append payload to our receive buffer
+                        else:
+                            print(f"TCP {self.owner}: Out of order packet seq {packet.seq} (expected {self.window['last_ack']})")
+                            should_ack = True
                         
-                            print(f"TCP {self.owner}: send ack for {packet.seq} with {len(packet.payload)} bytes.")
+                        # Set current expected ACK value for the response
+                        ack_to_send = self.window["last_ack"]
 
-                            # Send back an acknowledgment
-                            ack_val = packet.seq + len(packet.payload)
-                            ack_packet = Packet(seq=0, ack=ack_val, flags=ACK_FLAG)
-                            self.sock_fd.sendto(ack_packet.encode(), addr)
-                            # Update last_ack
-                            self.window["last_ack"] = ack_val
-                            self.window["last_ack_time"] = time.time()
-
-                            # if last packet in group notify
-                            if (packet.flags & SYN_FLAG) != 0:
-                                # end of send
-                                print(f"TCP {self.owner}: eof detected!")
-                                self.packet_cond.notify_all()
-                    """
-
+                if should_ack:
+                    print(f"TCP {self.owner}: sending ack {ack_to_send}")
+                    ack_pkt = Packet(seq=0, ack=ack_to_send, flags=ACK_FLAG, window=self.get_advertised_window())
+                    self.sock_fd.sendto(ack_pkt.encode(), addr)
             except socket.timeout:
-               continue
-        
+                continue
             except Exception as e:
                 if not self.dying:
-                    print(f"TCP {self.owner}: Error in backend: {e}")
-
+                    print(f"TCP {self.owner}: Backend exception: {e}")
+                break
