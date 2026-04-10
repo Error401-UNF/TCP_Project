@@ -3,7 +3,7 @@ import struct
 import threading
 import time
 from typing import Any  
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_INITIAL_WINDOW_SIZE, WINDOW_INITIAL_SSTHRESH
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -70,6 +70,13 @@ class TransportSocket:
         self.rttvar = None
         self.sent_times = {}
 
+        # Congestion control
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        self.buffered_data:dict[int,Packet] = {}
+        self.buffered_data_size = 0
+        self.acked_sequence_numbs:list = []
+
         self.window = {
             "last_ack": 0,            # The next seq we expect from peer (receiving)
             "last_ack_time": time.time(),
@@ -79,7 +86,6 @@ class TransportSocket:
             "messages_available": 0,  # Count of completed EOF-terminated messages
             "next_seq_to_send": 0,    # Pointer for next byte to send
             "base": 0,                # Oldest unacknowledged byte
-            "current_window": MSS,    # Start with 1 MSS (AIMD growth)
             "peer_advertised": MAX_NETWORK_BUFFER # What the peer says they can handle
         }
         self.sock_type = None
@@ -135,7 +141,7 @@ class TransportSocket:
         
         return EXIT_SUCCESS
 
-    def update_rto(self, measured_rtt: float):
+    def update_rto(self, measured_rtt: float) -> None:
         """Implement EWMA for RTT estimation and RTO calculation
 
         Args:
@@ -162,6 +168,8 @@ class TransportSocket:
         if not self.conn:
             raise ValueError(f"TCP {self.owner}: Connection not established.")
         with self.send_lock:
+            self.acked_sequence_numbs.clear()
+            self.sent_times.clear()
             self.send_segment(data)
 
     def recv(self, buf: list, length: int, flags: int) -> int:
@@ -205,7 +213,7 @@ class TransportSocket:
 
     def get_advertised_window(self):
         """ Calculate remaining buffer space for Flow Control """
-        return max(0, MAX_NETWORK_BUFFER - self.window["recv_len"])
+        return max(0, MAX_NETWORK_BUFFER - self.window["recv_len"] - self.buffered_data_size)
 
     def send_segment(self, data:Any):
         """sends data as a bunch of segments.
@@ -221,17 +229,24 @@ class TransportSocket:
                 if (self.window["base"] - start_seq) >= total_len:
                     break
 
-                effective_window = min(self.window["current_window"], self.window["peer_advertised"])
+                effective_window = min(self.cwnd, self.window["peer_advertised"])
 
                 while (self.window["next_seq_to_send"] - self.window["base"]) < effective_window:
                     offset = self.window["next_seq_to_send"] - start_seq
                     if offset >= total_len:
                         break
                     
+                    
                     payload_len = min(MSS, total_len - offset)
                     chunk = data[offset : offset + payload_len]
                     
                     curr_seq = self.window["next_seq_to_send"]
+                    if curr_seq in self.acked_sequence_numbs:
+                        # skip, go next
+                        self.window["next_seq_to_send"] += payload_len
+                        print(f"TCP {self.owner}: skipped sequence no:{curr_seq}")
+                        continue
+                        
                     print(f"TCP {self.owner}: Sending segment seq={curr_seq}, len={payload_len}")
                     
                     # Store time for RTT estimation
@@ -250,11 +265,10 @@ class TransportSocket:
 
                 # Wait using the dynamic RTO
                 if not self.wait_cond.wait(timeout=self.rto):
-                    # Timeout occurred - Karn's algorithm: don't update RTT on retransmission
-                    # Clear sent_times for unacked data to avoid false RTT samples
-                    self.sent_times.clear()
-                    self.window["current_window"] = max(MSS, self.window["current_window"] // 2)
-                    print(f"TCP {self.owner}: Timeout! New Window: {self.window['current_window']}, RTO: {self.rto:.4f}")
+                    # timed out
+                    self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+                    self.ssthresh = min(2*MSS, self.cwnd/2)
+                    print(f"TCP {self.owner}: Timeout! New Window size: {self.cwnd}, RTO: {self.rto:.4f}")
                     self.window["next_seq_to_send"] = self.window["base"]
 
         self.send_eof_marker()
@@ -311,6 +325,8 @@ class TransportSocket:
                     # 1. Handle incoming ACKs
                     if (packet.flags & ACK_FLAG) != 0:
                         if packet.ack > self.window["base"]:
+                            if self.cwnd < self.ssthresh: self.cwnd += MSS 
+                            else: self.cwnd += (MSS**2)/self.cwnd
                             for seq in list(self.sent_times.keys()):
                                 if seq < packet.ack:
                                     # relcalculate rto
@@ -318,8 +334,8 @@ class TransportSocket:
                                     self.update_rto(measured_rtt)
                                     # Clear all samples before this ack
                                     del self.sent_times[seq]
+                                    self.acked_sequence_numbs.append(seq)
                             # update window
-                            self.window["current_window"] += MSS
                             self.window["base"] = packet.ack
                             self.window["next_seq_expected"] = packet.ack
                             self.wait_cond.notify_all()
@@ -329,17 +345,38 @@ class TransportSocket:
                         if packet.seq == self.window["last_ack"]:
                             if (packet.flags & SYN_FLAG) == 0:
                                 # regular data packet
-                                if self.window["recv_len"] + len(packet.payload) <= MAX_NETWORK_BUFFER:
+                                # also check to see if this packet has already been injested
+                                if self.window["recv_len"] + len(packet.payload) <= MAX_NETWORK_BUFFER and self.window["last_ack"] + len(packet.payload) not in self.acked_sequence_numbs: 
                                     self.window["recv_buf"] += packet.payload
                                     self.window["recv_len"] += len(packet.payload)
                                     self.window["last_ack"] += len(packet.payload)
+                                    ack_to_send = self.window["last_ack"]
+                                else:
+                                    ack_to_send = self.window["last_ack"]
+                                # then check window for packets
+                                while self.window["last_ack"] in self.buffered_data:
+                                    print(f"TCP {self.owner}: Buffer injected",self.window["last_ack"])
+                                    print(f"TCP {self.owner}: Buffered data: {list(self.buffered_data.keys())}")
+                                    packet = self.buffered_data[self.window["last_ack"]]
+                                    del self.buffered_data[self.window["last_ack"]]
+                                    self.window["recv_buf"] += packet.payload
+                                    self.window["recv_len"] += len(packet.payload)
+                                    self.window["last_ack"] += len(packet.payload)
+                                    self.buffered_data_size -= len(packet.payload)
                             else:
                                 # end of file
                                 self.window["last_ack"] += len(packet.payload)
                                 self.window["messages_available"] += 1
-                            self.packet_cond.notify_all()
-                        ack_to_send = self.window["last_ack"]
-                
+                                ack_to_send = self.window["last_ack"]
+                            self.packet_cond.notify_all() # only notify at end of file
+                        else:
+                            print(f"TCP {self.owner}: Out of order packet Got:",packet.seq,"Expected:",self.window["last_ack"])
+                            # this is where i can implement windows + psudo selective acks?
+                            if self.window["last_ack"] < packet.seq and self.window["recv_len"] + self.buffered_data_size + len(packet.payload)<= MAX_NETWORK_BUFFER: # future packet
+                                self.buffered_data[packet.seq] = packet
+                                self.buffered_data_size += len(packet.payload) # add the size of the paylod+header
+                            ack_to_send = self.window["last_ack"]
+
                         # send ack
                         ack_pkt = Packet(seq=0, ack=ack_to_send, flags=ACK_FLAG, window=self.get_advertised_window())
                         self.sock_fd.sendto(ack_pkt.encode(), addr)

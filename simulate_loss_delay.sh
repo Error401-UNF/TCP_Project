@@ -4,8 +4,8 @@
 IFACE="lo"
 
 # Parameters for network simulation
-DELAY="10ms"    # Add 100ms delay
-LOSS="50%"       # Simulate 10% packet loss
+DELAY="100ms"    # Add 100ms delay
+LOSS="10%"       # Simulate 10% packet loss
 
 # Function to apply network conditions
 apply_network_conditions() {

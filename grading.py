@@ -1,8 +1,8 @@
 import struct
 
 # Constants for the project
-MAX_LEN = 400  # Maximum packet length
-MSS = MAX_LEN - struct.calcsize("!IIIIH")  # Maximum Segment Size (based on Packet header size)
+MAX_LEN = 200  # Maximum packet length
+MSS = MAX_LEN - struct.calcsize("!IIBHQH")  # Maximum Segment Size (based on Packet header size)
 
 # Window variables
 WINDOW_SIZE = MSS * 32  # Sliding window size (32 packets)
