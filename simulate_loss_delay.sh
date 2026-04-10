@@ -4,7 +4,7 @@
 IFACE="lo"
 
 # Parameters for network simulation
-DELAY="100ms"    # Add 100ms delay
+DELAY="5ms"    # Add 100ms delay
 LOSS="10%"       # Simulate 10% packet loss
 
 # Function to apply network conditions
